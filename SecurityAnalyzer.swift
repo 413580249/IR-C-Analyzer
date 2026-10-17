@@ -78,19 +78,66 @@ enum SecurityAnalysisError: LocalizedError {
     }
 }
 
+
 enum SecurityAnalyzer {
+    // MARK: - 規則設定
+
     static let windowSeconds = 60
     static let threshold = 10
 
-    // B 的 SecurityEvent 沒有 sensitive 欄位。
-    // 第一版由我們明確指定這個檔案為「測試用敏感目標」。
-    // 這是專題的測試設定，不是 iOS 自動判定檔案具有敏感性。
-    static let sensitiveTargets: Set<String> = ["test_private_file.txt"]
+    // 測試用敏感檔案清單
+    static let sensitiveTargets: Set<String> = [
+        "test_private_file.txt"
+    ]
+
+    // 新增兩條規則的門檻
+    static let multiFileThreshold = 5
+    static let failedReadThreshold = 5
 
     private struct TimedEvent {
+        let event: SecurityEvent
         let date: Date
-        let timestamp: String
     }
+
+    private struct Peak {
+        let count: Int
+        let start: String
+        let end: String
+    }
+
+    // MARK: - 時間解析
+
+    private static func parseDate(
+        _ event: SecurityEvent
+    ) throws -> Date {
+
+        let hasTimeZone = event.timestamp.range(
+            of: "(Z|[+-][0-9]{2}:[0-9]{2})$",
+            options: .regularExpression
+        ) != nil
+
+        let standard = ISO8601DateFormatter()
+        standard.formatOptions = [.withInternetDateTime]
+
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [
+            .withInternetDateTime,
+            .withFractionalSeconds
+        ]
+
+        guard hasTimeZone,
+              let date = fractional.date(from: event.timestamp)
+                ?? standard.date(from: event.timestamp) else {
+            throw SecurityAnalysisError.invalidTimestamp(
+                eventID: event.eventID,
+                timestamp: event.timestamp
+            )
+        }
+
+        return date
+    }
+
+    // MARK: - 原始敏感資料規則
 
     static func shouldCount(_ event: SecurityEvent) -> Bool {
         event.action == "read"
@@ -98,86 +145,145 @@ enum SecurityAnalyzer {
             && sensitiveTargets.contains(event.target)
     }
 
-    static func analyze(events: [SecurityEvent]) throws -> SecurityAnalysisResult {
-        var grouped: [String: [TimedEvent]] = [:]
+    // MARK: - 60 秒滑動視窗
 
-        // B 目前產生的時間不含小數秒；也接受未來含小數秒的時間。
-        let standardFormatter = ISO8601DateFormatter()
-        standardFormatter.formatOptions = [.withInternetDateTime]
-        let fractionalFormatter = ISO8601DateFormatter()
-        fractionalFormatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    private static func findPeak(
+        _ events: [TimedEvent],
+        score: (ArraySlice<TimedEvent>) -> Int
+    ) -> Peak? {
 
-        // 1. 只計入「成功讀取指定敏感目標」，再依來源分組。
-        for event in events {
-            guard shouldCount(event) else { continue }
+        guard !events.isEmpty else { return nil }
 
-            // 與 Python 一樣要求時間帶時區，避免把本地時間誤當成 UTC。
-            let hasTimeZone = event.timestamp.range(
-                of: "(Z|[+-][0-9]{2}:[0-9]{2})$",
-                options: .regularExpression
-            ) != nil
+        let sorted = events.sorted { $0.date < $1.date }
 
-            guard hasTimeZone,
-                  let date = fractionalFormatter.date(from: event.timestamp)
-                    ?? standardFormatter.date(from: event.timestamp) else {
-                throw SecurityAnalysisError.invalidTimestamp(
-                    eventID: event.eventID,
-                    timestamp: event.timestamp
-                )
+        var left = 0
+        var best: Peak?
+
+        for right in sorted.indices {
+
+            while sorted[right].date
+                .timeIntervalSince(sorted[left].date)
+                > Double(windowSeconds) {
+                left += 1
             }
 
+            let window = sorted[left...right]
+            let count = score(window)
+
+            if count > (best?.count ?? 0) {
+                best = Peak(
+                    count: count,
+                    start: sorted[left].event.timestamp,
+                    end: sorted[right].event.timestamp
+                )
+            }
+        }
+
+        return best
+    }
+
+    // MARK: - 分析入口
+
+    static func analyze(
+        events: [SecurityEvent]
+    ) throws -> SecurityAnalysisResult {
+
+        var grouped: [String: [TimedEvent]] = [:]
+
+        for event in events {
+            let date = try parseDate(event)
+
             grouped[event.source, default: []].append(
-                TimedEvent(date: date, timestamp: event.timestamp)
+                TimedEvent(event: event, date: date)
             )
         }
 
         var findings: [SecurityFinding] = []
 
-        // 2. 對每個來源找出「這批事件中，任意 60 秒內」的最大次數。
-        // 不是只查看目前時間往前 60 秒；保留你原本 Python 的行為。
         for source in grouped.keys.sorted() {
-            guard let sourceEvents = grouped[source] else { continue }
-            let timestamps = sourceEvents.sorted { $0.date < $1.date }
-            var left = 0
-            var maxCount = 0
-            var peakStart: String?
-            var peakEnd: String?
 
-            for right in timestamps.indices {
-                // 剛好相隔 60 秒仍包含在同一時間範圍內。
-                while timestamps[right].date.timeIntervalSince(timestamps[left].date)
-                    > Double(windowSeconds) {
-                    left += 1
-                }
-
-                let count = right - left + 1
-                if count > maxCount {
-                    maxCount = count
-                    peakStart = timestamps[left].timestamp
-                    peakEnd = timestamps[right].timestamp
-                }
+            guard let sourceEvents = grouped[source] else {
+                continue
             }
 
-            // 3. 保留原規則的 >，而不是 >=：10 次不觸發，11 次才觸發。
-            if maxCount > threshold, let start = peakStart, let end = peakEnd {
+            // 規則 1：敏感資料大量讀取
+            let sensitiveReads = sourceEvents.filter {
+                shouldCount($0.event)
+            }
+
+            if let peak = findPeak(
+                sensitiveReads,
+                score: { $0.count }
+            ), peak.count > threshold {
+
                 findings.append(SecurityFinding(
                     ruleID: "sensitive_read_burst",
                     source: source,
                     risk: "medium",
-                    count: maxCount,
-                    windowStart: start,
-                    windowEnd: end,
-                    reason: "同一來源在 \(windowSeconds) 秒內，成功讀取敏感資料 \(maxCount) 次，超過設定門檻 \(threshold) 次。",
-                    recommendation: "確認操作是否符合預期，並檢查相關存取紀錄。"
+                    count: peak.count,
+                    windowStart: peak.start,
+                    windowEnd: peak.end,
+                    reason: "60 秒內成功讀取敏感資料 \(peak.count) 次，超過門檻 \(threshold) 次。",
+                    recommendation: "確認敏感資料存取是否符合預期。"
+                ))
+            }
+
+            // 規則 2：短時間讀取多個不同檔案
+            let successfulReads = sourceEvents.filter {
+                $0.event.action == "read"
+                    && $0.event.result == "allowed"
+            }
+
+            if let peak = findPeak(
+                successfulReads,
+                score: { window in
+                    Set(window.map { $0.event.target }).count
+                }
+            ), peak.count >= multiFileThreshold {
+
+                findings.append(SecurityFinding(
+                    ruleID: "multi_file_read",
+                    source: source,
+                    risk: "medium",
+                    count: peak.count,
+                    windowStart: peak.start,
+                    windowEnd: peak.end,
+                    reason: "60 秒內成功讀取 \(peak.count) 個不同檔案，達到多檔案偵測門檻。",
+                    recommendation: "檢查是否存在非預期的批次檔案存取。"
+                ))
+            }
+
+            // 規則 3：短時間大量讀取失敗
+            let failedReads = sourceEvents.filter {
+                $0.event.action == "read"
+                    && $0.event.result == "failed"
+            }
+
+            if let peak = findPeak(
+                failedReads,
+                score: { $0.count }
+            ), peak.count >= failedReadThreshold {
+
+                findings.append(SecurityFinding(
+                    ruleID: "repeated_read_failure",
+                    source: source,
+                    risk: "medium",
+                    count: peak.count,
+                    windowStart: peak.start,
+                    windowEnd: peak.end,
+                    reason: "60 秒內讀取失敗 \(peak.count) 次，達到連續失敗偵測門檻。",
+                    recommendation: "檢查檔案是否存在、操作權限及失敗原因。"
                 ))
             }
         }
 
-        // 模擬事件照常參與計算，才能使用 B 的測試按鈕驗證這項規則。
-        // status 表示有沒有觸發本規則，不是整個 App 是否安全的判定。
-        // 只能分析傳入且仍保留的事件；EventStore 的 50 筆上限仍然適用。
+        // 保留第一版 JSON 介面供 B 使用。
+        // rule 欄位仍描述原本的敏感讀取規則；
+        // 新規則透過 findings.rule_id 區分。
         return SecurityAnalysisResult(
-            status: findings.isEmpty ? "no_rule_triggered" : "suspicious",
+            status: findings.isEmpty
+                ? "no_rule_triggered"
+                : "suspicious",
             totalEvents: events.count,
             rule: SecurityAnalysisRule(
                 windowSeconds: windowSeconds,
